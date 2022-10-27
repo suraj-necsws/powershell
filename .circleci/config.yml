@@ -315,7 +315,7 @@ jobs:
           command: |
             cp .circleci/spec.yml taskbuilder/resources
             sudo chown -R circleci:circleci /usr/local/bin
-            sudo chown -R circleci:circleci /usr/local/lib/python*/site-packages
+            sudo chown -R circleci:circleci /usr/local/lib/python*/dist-packages
             pip install boto3
             pip install pyyaml
             python taskbuilder/aws-taskbuilder.py
