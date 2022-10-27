@@ -1,0 +1,15 @@
+service-name: referral
+service-port: 9104
+
+pathways-services:
+  - intervention
+  - yot-workflow
+  - document
+  - person
+  - refdata
+  
+
+database-services:
+  - postgres
+
+aws-services:

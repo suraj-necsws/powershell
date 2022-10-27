@@ -1,0 +1,634 @@
+version: 2.1
+
+parameters:
+  release:
+    type: string
+    default: default
+  body:
+    type: string
+    default: branch
+
+references:
+  common: &common
+    product: pathways
+    service-name: referral
+    port: 9104
+    desired-count: 1
+
+  cache_key: &cache_key
+    m2cache-{{ .Environment.PATHWAYS_SHARED_VERSION }}-{{ .Environment.SHARED_AP_VERSION }}
+
+  mvn_repo: &mvn_repo
+    USERNAME: USERNAME
+    GPG_TOKEN: GPG_TOKEN
+
+  container_config: &container_config
+    docker:
+      - image: cimg/openjdk:11.0
+
+  test_config: &test_config
+    docker:
+      - image: cimg/openjdk:11.0
+        environment:
+          PIPENV_VENV_IN_PROJECT: true
+
+  deployment_config: &deployment_config
+    docker:
+      - image: cimg/python:3.8
+        environment:
+          PIPENV_VENV_IN_PROJECT: true
+
+  load_repo: &load_repo
+    restore_cache:
+      key: v1-repo-{{ .Branch }}-{{ .Revision }}
+
+  load_circleci: &load_circleci
+    restore_cache:
+      key: v1-repo-{{ .Branch }}-{{ .Revision }}
+
+  load_build: &load_build
+    restore_cache:
+      key: v1-build-{{ .Branch }}-{{ .Revision }}
+
+  load_docker_cache: &load_docker_cache
+    restore_cache:
+      key: docker-cache-{{ .Branch }}-{{ .Revision }}
+
+  load_mvn_cache: &load_mvn_cache
+    restore_cache:
+      key: circleci-service-name-{{ checksum "pom.xml" }}
+
+  deploy_deps: &deploy_deps
+    run: |
+      sudo apt-get -qq update
+      sudo apt-get -qq install gettext-base build-essential less ntp -y
+
+      sudo ln -s /home/circleci/.local/bin/aws /usr/bin/aws
+      echo "export PATH=\"~/bin:$PATH\"" >> $BASH_ENV
+      echo "export ARTEFACT_BUCKET=\"pathways-artefacts\"" >> $BASH_ENV
+      echo "export IMAGETAG=\"${CIRCLE_BRANCH//[@\/]/}${CIRCLE_TAG}-${CIRCLE_SHA1:0:7}\"" >> $BASH_ENV
+
+orbs:
+  aws-cli: circleci/aws-cli@2.0.3
+  aws-s3: circleci/aws-s3@1.0.16
+  aws-ecs: circleci/aws-ecs@1.3.0
+
+executors:
+  build-executor:
+    docker:
+      - image: cimg/openjdk:11.0
+
+  hold-executor:
+    docker:
+      - image: alpine:3.7
+
+jobs:
+  Build-Image:
+    parameters:
+      product:
+        type: string
+      service-name:
+        type: string
+      port:
+        type: integer
+      desired-count:
+        type: integer
+      USERNAME:
+        type: string
+      GPG_TOKEN:
+        type: string
+    <<: *container_config
+    resource_class: medium
+    steps:
+      - aws-cli/setup
+      - checkout
+      - *deploy_deps
+      - *load_build
+      - *load_repo
+      - *load_mvn_cache
+      - run:
+          name: Create Vars
+          command: |-
+            echo "export REPO=\"<< parameters.product >>/${CIRCLE_PROJECT_REPONAME}\"" >> $BASH_ENV
+            echo "export PATHWAYS_SHARED_VERSION=\"$(aws secretsmanager get-secret-value --secret-id pathways-shared-version-string --query SecretString --output text | jq .version -r)\"" >> $BASH_ENV
+            echo "export SHARED_AP_VERSION=\"$(aws secretsmanager get-secret-value --secret-id sharedap-version-string --query SecretString --output text | jq .version -r)\"" >> $BASH_ENV
+      - attach_workspace:
+          at: /home/circleci
+      - run: ls -l /home/circleci
+      - setup_remote_docker:
+          docker_layer_caching: true
+      - run: mvn -s .circleci/settings.xml dependency:go-offline
+      - save_cache:
+          paths:
+            - ~/.m2
+          # key: *cache_key
+          key: circleci-service-name-{{ checksum "pom.xml" }}
+      - run: mvn -s .circleci/settings.xml dependency:purge-local-repository clean install package docker:build -DdockerImageTags=$IMAGETAG -Dmaven.test.skip=true
+      - run: |
+          mkdir -p docker-cache
+          docker save -o docker-cache/built-image.tar $REPO:$IMAGETAG
+      - run: echo "export IMAGETAG=$IMAGETAG" >> new-env-vars
+      - save_cache:
+          key: v1-repo-{{ .Branch }}-{{ .Revision }}
+          paths:
+            - ~/project
+      - save_cache:
+          key: v1-circleci-{{ .Branch }}-{{ .Revision }}
+          paths:
+            - .circleci
+      - save_cache:
+          key: docker-cache-{{ .Branch }}-{{ .Revision }}
+          paths:
+            - docker-cache
+
+  Test-Build:
+    <<: *test_config
+    parameters:
+      product:
+        type: string
+      service-name:
+        type: string
+      port:
+        type: integer
+      desired-count:
+        type: integer
+      USERNAME:
+        type: string
+      GPG_TOKEN:
+        type: string
+    steps:
+      - aws-cli/setup
+      - checkout
+      - *load_mvn_cache
+      - *load_repo
+      - attach_workspace:
+          at: /home/circleci/project
+      - run:
+          name: Create Vars
+          command: |-
+            echo "export SERVICE_NAME=\"<< parameters.service-name >>\"" >> $BASH_ENV
+            echo "export PATHWAYS_SHARED_VERSION=\"$(aws secretsmanager get-secret-value --secret-id pathways-shared-version-string --query SecretString --output text | jq .version -r)\"" >> $BASH_ENV
+            echo "export SHARED_AP_VERSION=\"$(aws secretsmanager get-secret-value --secret-id sharedap-version-string --query SecretString --output text | jq .version -r)\"" >> $BASH_ENV
+      - run:
+          name: Echo Package Versions
+          command: |-
+            echo $PATHWAYS_SHARED_VERSION
+            echo $SHARED_AP_VERSION
+      - run: mvn -s .circleci/settings.xml dependency:go-offline
+      - save_cache:
+          paths:
+            - ~/.m2
+          # key: *cache_key
+          key: circleci-service-name-{{ checksum "pom.xml" }}
+      - run: mvn -s .circleci/settings.xml clean verify test -Dmaven.test.skip=true
+      - run:
+          name: Creates jacoco report
+          command: mvn -s .circleci/settings.xml jacoco:report
+      - persist_to_workspace:
+          root: /home/circleci/project/
+          paths:
+            - target
+
+  Process-Test:
+    parameters:
+      environment:
+        type: string
+      product:
+        type: string
+      service-name:
+        type: string
+      port:
+        type: integer
+      desired-count:
+        type: integer
+    <<: *deployment_config
+    resource_class: small
+    steps:
+      - aws-cli/setup
+      - *load_circleci
+      - attach_workspace:
+          at: /home/circleci
+      - attach_workspace:
+          at: /home/circleci/project/
+      - run:
+          name: Create Vars
+          command: |-
+            echo "export SERVICE_NAME=\"<< parameters.service-name >>\"" >> $BASH_ENV
+            echo "export JIRA_USERNAME=\"$jira_username\"" >> $BASH_ENV
+            echo "export JIRA_PASSWORD=\"$jira_password\"" >> $BASH_ENV
+      - aws-s3/sync:
+          from: s3://pathways-<< parameters.environment >>/taskbuilder
+          to: taskbuilder
+          arguments: --cache-control "max-age=86400"
+          overwrite: true
+      - run:
+          name: Process depends check
+          command: |
+            pip install bs4
+            pip install lxml
+            pip install requests
+            pip install pyyaml
+            python taskbuilder/depends-check.py
+      - run:
+          name: Updates code coverage page
+          command: |
+            pip install bs4
+            pip install lxml
+            pip install requests
+            pip install pandas
+            python taskbuilder/code-coverage-processer.py
+
+  Push-Image:
+    parameters:
+      product:
+        type: string
+      service-name:
+        type: string
+      port:
+        type: integer
+      desired-count:
+        type: integer
+    <<: *deployment_config
+    resource_class: small
+    steps:
+      - aws-cli/setup
+      - *load_docker_cache
+      - attach_workspace:
+          at: /home/circleci
+      - setup_remote_docker:
+          docker_layer_caching: true
+      - run:
+          name: Create Vars
+          command: |-
+            echo "export SERVICE_NAME=\"<< parameters.service-name >>\"" >> $BASH_ENV
+            echo "export REPO=\"<< parameters.product >>/${CIRCLE_PROJECT_REPONAME}\"" >> $BASH_ENV
+            echo "export IMAGETAG=\"${CIRCLE_BRANCH//[@\/]/}${CIRCLE_TAG}-${CIRCLE_SHA1:0:7}\"" >> $BASH_ENV
+      - run:
+          name: AWS ECR Login
+          command: |
+            aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ECR_ACCOUNT_URL
+      - run:
+          name: Restore Image
+          command: |
+            docker load < docker-cache/built-image.tar
+      - run:
+          name: Docker push
+          command: |
+            docker tag $REPO:$IMAGETAG $AWS_ECR_ACCOUNT_URL/$REPO:$IMAGETAG
+            docker push $AWS_ECR_ACCOUNT_URL/$REPO --all-tags
+
+  Deploy-Task:
+    parameters:
+      environment:
+        type: string
+      product:
+        type: string
+      service-name:
+        type: string
+      port:
+        type: integer
+      desired-count:
+        type: integer
+    <<: *deployment_config
+    resource_class: small
+    steps:
+      - aws-cli/setup
+      - *load_circleci
+      - attach_workspace:
+          at: /home/circleci
+      - run:
+          name: Create Vars
+          command: |-
+            echo "export SERVICE_NAME=\"<< parameters.service-name >>\"" >> $BASH_ENV
+            echo "export PORT=\"<< parameters.port >>\"" >> $BASH_ENV
+            echo "export DC=\"<< parameters.desired-count >>\"" >> $BASH_ENV
+            echo "export AWS_ACCOUNT_SHORT_NAME=\"<< parameters.environment >>\"" >> $BASH_ENV
+            echo "export AWS_ACCOUNT_URL=\"$AWS_ECR_ACCOUNT_URL\"" >> $BASH_ENV
+            echo "export IMAGETAG=\"${CIRCLE_BRANCH//[@\/]/}${CIRCLE_TAG}-${CIRCLE_SHA1:0:7}\"" >> $BASH_ENV
+      - aws-s3/sync:
+          from: s3://pathways-<< parameters.environment >>/taskbuilder
+          to: taskbuilder
+          arguments: --cache-control "max-age=86400"
+          overwrite: true
+      - run:
+          name: Build Task
+          command: |
+            cp .circleci/spec.yml taskbuilder/resources
+            sudo chown -R circleci:circleci /usr/local/bin
+            sudo chown -R circleci:circleci /usr/local/lib/python*/site-packages
+            pip install boto3
+            pip install pyyaml
+            python taskbuilder/aws-taskbuilder.py
+      - run:
+          name: Updating task def
+          command: |
+            TASK_DEFINITION_JSON="$(echo taskbuilder/output/service-task.json)"
+            if [ "${TASK_DEFINITION_JSON:0:1}" != "/" ]; then
+              TASK_DEFINITION_JSON="$(pwd)/${TASK_DEFINITION_JSON}"
+            fi
+            REVISION=$(aws ecs register-task-definition \
+            --cli-input-json file://${TASK_DEFINITION_JSON} \
+            --output text \
+            --query 'taskDefinition.taskDefinitionArn')
+            echo "export CCI_ORB_AWS_ECS_REGISTERED_TASK_DFN=${REVISION}" >> new-env-vars
+      - run:
+          name: Create or Update Service
+          command: |
+            cp .circleci/spec.yml taskbuilder/resources
+            source new-env-vars
+            python taskbuilder/deploy-service.py
+
+workflows:
+  version: 2
+  scheduled:
+    triggers:
+      - schedule:
+          # Weekly schedule at 9pm each Friday
+          cron: "00 21 * * 5"
+          filters:
+            branches:
+              only:
+                - develop
+    jobs:
+      - Deploy-Task:
+          name: deploy_unstable
+          <<: *common
+          environment: unstable
+          context:
+            - resource
+            - unstable
+  development:
+    when:
+      equal: [ default, << pipeline.parameters.release >> ]
+    jobs:
+### Unstable Env (unstable branch)
+      - Build-Image:
+          name: build_docker_image_unstable
+          <<: *common
+          <<: *mvn_repo
+          context:
+            - resource
+            - unstable # needs access to secrets manager in unstable env for shared package versions
+            - github
+          filters:
+            branches:
+              only:
+                - unstable
+
+      - Push-Image:
+          name: push_docker_image_unstable
+          <<: *common
+          context:
+            - resource
+            - unstable # push to resource acc so any keys will do
+          filters:
+            branches:
+              only:
+                - unstable
+          requires:
+            - build_docker_image_unstable
+
+      - Test-Build:
+          name: test_service_unstable
+          <<: *common
+          <<: *mvn_repo
+          context:
+            - resource
+            - unstable # needs access to secrets manager in unstable env for shared package versions
+            - github
+          filters:
+            branches:
+              only:
+                - unstable
+
+      - Deploy-Task:
+          name: deploy_task_unstable
+          <<: *common
+          environment: unstable
+          context:
+            - resource
+            - unstable
+          filters:
+            branches:
+              only:
+                - unstable
+          requires:
+            - push_docker_image_unstable
+
+### Stable Env (develop branch)
+      - Build-Image:
+          name: build_docker_image
+          <<: *common
+          <<: *mvn_repo
+          context:
+            - resource
+            - stable # needs access to secrets manager in stable env for shared package versions
+            - github
+          filters:
+            branches:
+              only:
+                - develop
+
+      - Push-Image:
+          name: push_docker_image
+          <<: *common
+          context:
+            - resource
+            - stable # push to resource acc so any keys will do
+          filters:
+            branches:
+              only:
+                - unstable
+                - develop
+          requires:
+            - build_docker_image
+
+      - Test-Build:
+          name: test_service
+          <<: *common
+          <<: *mvn_repo
+          context:
+            - resource
+            - stable # needs access to secrets manager in stable env for shared package versions
+            - github
+          filters:
+            branches:
+              only:
+                - unstable
+                - develop
+
+      - Process-Test:
+          name: process_test_result
+          <<: *common
+          environment: stable
+          context:
+            - resource
+            - stable
+            - jira
+          filters:
+            branches:
+              only:
+                - develop
+          requires:
+            - test_service
+
+### Stable Env (develop branch)
+      - Deploy-Task:
+          name: deploy_task_stable
+          <<: *common
+          environment: stable
+          context:
+            - resource
+            - stable
+          filters:
+            branches:
+              only:
+                - develop
+          requires:
+            - test_service
+            - push_docker_image
+
+### Triggered On Demand [ Tag and Branch based release ]
+  tagbased:
+    when:      
+      and:
+        - and:
+          - equal: [ tag, << pipeline.parameters.body >> ]
+        - or:
+          - equal: [ testing, << pipeline.parameters.release >> ]
+          - equal: [ unstable, << pipeline.parameters.release >> ]
+          - equal: [ sandpit, << pipeline.parameters.release >> ]
+          - equal: [ preprod, << pipeline.parameters.release >> ]
+    jobs:     
+      - Build-Image:
+          name: build_docker_image
+          <<: *common
+          <<: *mvn_repo
+          context:
+            - resource
+            - stable # needs access to secrets manager in stable env for shared package versions
+            - github
+          filters:
+            tags:
+              only: /^v.*/
+
+      - Push-Image:
+          name: push_docker_image
+          <<: *common
+          context:
+            - resource
+            - stable # push to resource acc so any keys will do
+          filters:
+            tags:
+              only: /^v.*/
+          requires:
+            - build_docker_image
+
+      - Deploy-Task:
+          name: deploy_task_<< pipeline.parameters.release >>
+          <<: *common
+          environment: << pipeline.parameters.release >>
+          context:
+            - resource
+            - << pipeline.parameters.release >>
+          requires:
+            - push_docker_image
+
+  ondemand:
+    when:
+      and:
+        - and:
+          - equal: [ branch, << pipeline.parameters.body >> ]
+        - or:
+          - equal: [ testing, << pipeline.parameters.release >> ]
+          - equal: [ unstable, << pipeline.parameters.release >> ]
+          - equal: [ sandpit, << pipeline.parameters.release >> ]
+          - equal: [ preprod, << pipeline.parameters.release >> ]
+
+    jobs:
+      - Build-Image:
+          name: build_docker_image
+          <<: *common
+          <<: *mvn_repo
+          context:
+            - resource
+            - stable # needs access to secrets manager in stable env for shared package versions
+            - github
+          filters:
+            branches:
+              only:
+                - release
+
+      - Push-Image:
+          name: push_docker_image
+          <<: *common
+          context:
+            - resource
+            - stable # push to resource acc so any keys will do
+          filters:
+            branches:
+              only:
+                - release
+          requires:
+            - build_docker_image
+
+      - Deploy-Task:
+          name: deploy_task_<< pipeline.parameters.release >>
+          <<: *common
+          environment: << pipeline.parameters.release >>
+          context:
+            - resource
+            - << pipeline.parameters.release >>
+          requires:
+            - push_docker_image
+
+### Production (inc Sandpit [aka Demo])
+  production:
+    when:
+      equal: [ production, << pipeline.parameters.release >> ]
+    jobs:
+      - Build-Image:
+          name: build_docker_image
+          <<: *common
+          <<: *mvn_repo
+          context:
+            - resource
+            - stable # needs access to secrets manager in stable env for shared package versions
+            - github
+          filters:
+            branches:
+              only:
+                - master
+
+      - Push-Image:
+          name: push_docker_image
+          <<: *common
+          context:
+            - resource
+            - stable # push to resource acc so any keys will do
+          filters:
+            branches:
+              only:
+                - master
+          requires:
+            - build_docker_image
+
+      - Deploy-Task:
+          name: deploy_task_production
+          <<: *common
+          environment: production
+          context:
+            - resource
+            - production
+          requires:
+            - push_docker_image
+
+      - Deploy-Task:
+          name: deploy_task_sandpit
+          <<: *common
+          environment: sandpit
+          context:
+            - resource
+            - sandpit
+          requires:
+            - push_docker_image
